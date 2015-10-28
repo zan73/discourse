@@ -1,0 +1,189 @@
+#!/bin/bash
+
+command=$1
+
+config_file=containers/app.yml
+cidbootstrap=cids/app_bootstrap.cid
+local_discourse=local_discourse
+
+if [ -n "$DOCKER_HOST" ]; then
+  docker_ip=`sed -e 's/^tcp:\/\/\(.*\):.*$/\1/' <<< "$DOCKER_HOST"`
+elif [ -x "$(which ip 2>/dev/null)" ]; then
+  docker_ip=`ip addr show docker0 | \
+                  grep 'inet ' | \
+                  awk '{ split($2,a,"/"); print a[1] }';`
+else
+  docker_ip=`ifconfig | \
+                  grep -B1 "inet addr" | \
+                  awk '{ if ( $1 == "inet" ) { print $2 } else if ( $2 == "Link" ) { printf "%s:" ,$1 } }' | \
+                  grep docker0 | \
+                  awk -F: '{ print $3 }';`
+fi
+
+host_run() {
+  read -r -d '' env_ruby << 'RUBY'
+  require 'yaml'
+
+  input = STDIN.readlines.join
+  yaml = YAML.load(input)
+
+  if host_run = yaml['host_run']
+    params = yaml['params'] || {}
+    host_run.each do |run|
+      params.each do |k,v|
+        run = run.gsub("$#{k}", v)
+      end
+      STDOUT.write "#{run}--SEP--"
+    end
+  end
+RUBY
+
+  host_run=`cat app.yml | docker run $user_args --rm -i -a stdout -a stdin zan73/discourse ruby -e "$env_ruby"`
+
+  while [ "$host_run" ] ; do
+    iter=${host_run%%--SEP--*}
+    echo
+    echo "Host run: $iter"
+    $iter || exit 1
+    echo
+    host_run="${host_run#*--SEP--}"
+  done
+}
+
+set_volumes() {
+  volumes=`cat app.yml | docker run $user_args --rm -i -a stdout -a stdin zan73/discourse ruby -e \
+        "require 'yaml'; puts YAML.load(STDIN.readlines.join)['volumes'].map{|v| '-v ' << v['volume']['host'] << ':' << v['volume']['guest'] << ' '}.join"`
+}
+
+set_links() {
+    links=`cat app.yml | docker run $user_args --rm -i -a stdout -a stdin zan73/discourse ruby -e \
+        "require 'yaml'; puts YAML.load(STDIN.readlines.join)['links'].map{|l| '--link ' << l['link']['name'] << ':' << l['link']['alias'] << ' '}.join"`
+}
+
+set_template_info() {
+
+    templates=`cat app.yml | docker run $user_args --rm -i -a stdin -a stdout zan73/discourse ruby -e \
+      "require 'yaml'; puts YAML.load(STDIN.readlines.join)['templates']"`
+
+
+    arrTemplates=(${templates// / })
+    config_data=$(cat app.yml)
+
+    input="hack: true"
+
+
+    for template in "${arrTemplates[@]}"
+    do
+      [ ! -z $template ] && {
+        input="$input _FILE_SEPERATOR_ $(cat $template)"
+      }
+    done
+
+    # we always want our config file last so it takes priority
+    input="$input _FILE_SEPERATOR_ $config_data"
+
+    read -r -d '' env_ruby << 'RUBY'
+    require 'yaml'
+
+    input=STDIN.readlines.join
+    # default to UTF-8 for the dbs sake
+    env = {'LANG' => 'en_US.UTF-8'}
+    input.split('_FILE_SEPERATOR_').each do |yml|
+       yml.strip!
+       begin
+         env.merge!(YAML.load(yml)['env'] || {})
+       rescue Psych::SyntaxError => e
+        puts e
+        puts "*ERROR."
+       rescue => e
+        puts yml
+        p e
+       end
+    end
+    puts env.map{|k,v| "-e\n#{k}=#{v}" }.join("\n")
+RUBY
+
+    raw=`exec echo "$input" | docker run $user_args --rm -i -a stdin -a stdout zan73/discourse ruby -e "$env_ruby"`
+
+    env=()
+    ok=1
+    while read i; do
+      if [ "$i" == "*ERROR." ]; then
+        ok=0
+      elif [ -n "$i" ]; then
+        env[${#env[@]}]=$i
+      fi
+    done <<< "$raw"
+
+    if [ "$ok" -ne 1 ]; then
+      echo "${env[@]}"
+      echo "YAML syntax error. Please check your /var/discourse/containers/*.yml config files."
+      exit 1
+    fi
+}
+
+run_start(){
+
+   host_run
+
+   docker_args=`cat app.yml | docker run $user_args --rm -i -a stdout -a stdin zan73/discourse ruby -e \
+          "require 'yaml'; puts YAML.load(STDIN.readlines.join)['docker_args']"`
+
+   set_template_info
+   set_volumes
+   set_links
+
+   (
+     hostname=`hostname`
+     set -x
+     docker run $user_args $links -d "${env[@]}" -h "$hostname-$config" \
+        -e DOCKER_HOST_IP=$docker_ip --name $config -t $volumes $docker_args $local_discourse/$config \
+        /sbin/boot
+
+   )
+   exit 0
+
+}
+
+run_bootstrap(){
+
+  host_run
+
+  set_template_info
+
+  base_image=`cat app.yml | docker run $user_args --rm -i -a stdin -a stdout zan73/discourse ruby -e \
+    "require 'yaml'; puts YAML.load(STDIN.readlines.join)['base_image']"`
+
+  update_pups=`cat app.yml | docker run $user_args --rm -i -a stdin -a stdout zan73/discourse ruby -e \
+    "require 'yaml'; puts YAML.load(STDIN.readlines.join)['update_pups']"`
+
+  if [[ ! X"" = X"$base_image" ]]; then
+    image=$base_image
+  fi
+
+  set_volumes
+  set_links
+
+  rm -f $cidbootstrap
+
+  run_command="cd /pups &&"
+  if [[ ! "false" =  $update_pups ]]; then
+    run_command="$run_command git pull &&"
+  fi
+  run_command="$run_command /pups/bin/pups --stdin"
+
+  echo $run_command
+
+  env=("${env[@]}" "-e" "SSH_PUB_KEY=$ssh_pub_key")
+
+  (exec echo "$input" | docker run $user_args $links "${env[@]}" -e DOCKER_HOST_IP=$docker_ip --cidfile $cidbootstrap -i -a stdin -a stdout -a stderr $volumes zan73/discourse \
+     /bin/bash -c "$run_command") \
+     || (docker rm `cat $cidbootstrap` && rm $cidbootstrap)
+
+  [ ! -e $cidbootstrap ] && echo "** FAILED TO BOOTSTRAP ** please scroll up and look for earlier error messages, there may be more than one" && exit 1
+
+  sleep 5
+
+  docker commit `cat $cidbootstrap` $local_discourse/$config || echo 'FAILED TO COMMIT'
+  docker rm `cat $cidbootstrap` && rm $cidbootstrap
+}
